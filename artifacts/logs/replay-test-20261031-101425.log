@@ -1,0 +1,21 @@
+========== FRUGAL Q2 REPLAY TEST ==========
+Execution time: 2026-10-31T10:14:25.866319200
+Transaction ID: TXN-f4904230-b1d1-4178-8a46-061edb4547e3
+Location: /transactions/TXN-f4904230-b1d1-4178-8a46-061edb4547e3
+POST status: 201
+Server timestamp (microseconds): 1793421865828694
+
+FIRST PUT
+HTTP status: 200
+Response: {"message":"Transaction updated successfully"}
+
+REPLAY PUT
+HTTP status: 409
+Response: {"error":"Replay attack detected"}
+Replay sent 0.192 ms after first PUT completion
+
+========== TEST RESULT ==========
+First PUT accepted: true
+Replay rejected: true
+Replay within 150 ms: true
+RESULT: PASS - Replay attack prevented.
