@@ -1,148 +1,112 @@
 
 package com.frugal.security;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.time.Instant;
 import java.util.HexFormat;
-import java.util.UUID;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public final class TransactionStore {
+public class TransactionStore {
 
-    private final ConcurrentHashMap<String, Transaction> transactions =
+    private final Map<String, Transaction> transactions =
             new ConcurrentHashMap<>();
 
     private final SecureRandom secureRandom = new SecureRandom();
 
-    /**
-     * Creates and stores a new transaction with a unique challenge.
-     */
     public Transaction createTransaction() {
+        String transactionId = randomHex(16);
+        String challengeToken = randomHex(32);
+        String saltSequence = randomHex(16);
 
-        String transactionId = "TXN-" + UUID.randomUUID();
+        long serverTimestampMicros =
+                System.currentTimeMillis() * 1_000L;
 
-        String challengeToken = generateRandomHex(32);
-
-        String saltSequence = generateRandomHex(16);
-
-        long serverTimestampMicros = getCurrentTimestampMicros();
+        String initialChainHash =
+                HmacSecurity.sha512Hex(
+                        transactionId + "." + challengeToken
+                                + "." + saltSequence);
 
         Transaction transaction = new Transaction(
                 transactionId,
                 challengeToken,
+                saltSequence,
                 serverTimestampMicros,
-                saltSequence
+                initialChainHash
         );
 
         transactions.put(transactionId, transaction);
-
         return transaction;
     }
 
-    /**
-     * Retrieves an existing transaction.
-     */
-    public Transaction findTransaction(String transactionId) {
-
-        if (transactionId == null) {
-            return null;
-        }
-
+    public Transaction getTransaction(String transactionId) {
         return transactions.get(transactionId);
     }
 
-    /**
-     * Checks whether the supplied challenge belongs
-     * to the specified transaction.
-     */
+    public Transaction findTransaction(String transactionId) {
+    return getTransaction(transactionId);
+}
+
     public boolean matchesChallenge(
             String transactionId,
-            String receivedChallenge) {
+            String suppliedChallenge) {
 
-        Transaction transaction = findTransaction(transactionId);
+        Transaction transaction = getTransaction(transactionId);
 
-        if (transaction == null || receivedChallenge == null) {
-            return false;
-        }
-
-        return MessageDigest.isEqual(
-                transaction.getChallengeToken()
-                        .getBytes(StandardCharsets.UTF_8),
-
-                receivedChallenge.getBytes(StandardCharsets.UTF_8)
-        );
+        return transaction != null
+                && HmacSecurity.constantTimeEquals(
+                        transaction.getChallengeToken(),
+                        suppliedChallenge);
     }
 
-    /**
-     * Atomically consumes a challenge.
-     *
-     * Only one request can successfully consume it,
-     * even when multiple requests arrive concurrently.
-     */
+    // Retained for compatibility with existing tests.
     public boolean consumeChallenge(String transactionId) {
+        Transaction transaction = getTransaction(transactionId);
 
-        Transaction transaction = findTransaction(transactionId);
-
-        if (transaction == null) {
-            return false;
-        }
-
-        return transaction.challengeConsumed
-        .compareAndSet(false, true);
+        return transaction != null && transaction.consumeOnly();
     }
 
-    /**
-     * Generates a cryptographically secure random hex string.
-     */
-    private String generateRandomHex(int byteLength) {
+    public boolean consumeChallengeAndAdvanceChain(
+            String transactionId,
+            String previousChainHash,
+            String nextChainHash) {
 
-        byte[] bytes = new byte[byteLength];
+        Transaction transaction = getTransaction(transactionId);
 
+        return transaction != null
+                && transaction.consumeAndAdvance(
+                        previousChainHash, nextChainHash);
+    }
+
+    private String randomHex(int byteCount) {
+        byte[] bytes = new byte[byteCount];
         secureRandom.nextBytes(bytes);
-
         return HexFormat.of().formatHex(bytes);
     }
 
-    /**
-     * Generates the current timestamp in microseconds.
-     */
-    private long getCurrentTimestampMicros() {
-
-        Instant now = Instant.now();
-
-        return now.getEpochSecond() * 1_000_000L
-                + now.getNano() / 1_000L;
-    }
-
-    /**
-     * Represents a transaction and its security state.
-     */
-    public static final class Transaction {
+    public static class Transaction {
 
         private final String transactionId;
-
         private final String challengeToken;
-
+        private final String saltSequence;
         private final long serverTimestampMicros;
 
-        private final String saltSequence;
+        private final AtomicBoolean consumed = new AtomicBoolean(false);
 
-        private final AtomicBoolean challengeConsumed =
-                new AtomicBoolean(false);
+        private String currentChainHash;
 
-        private Transaction(
+        public Transaction(
                 String transactionId,
                 String challengeToken,
+                String saltSequence,
                 long serverTimestampMicros,
-                String saltSequence) {
+                String initialChainHash) {
 
             this.transactionId = transactionId;
             this.challengeToken = challengeToken;
-            this.serverTimestampMicros = serverTimestampMicros;
             this.saltSequence = saltSequence;
+            this.serverTimestampMicros = serverTimestampMicros;
+            this.currentChainHash = initialChainHash;
         }
 
         public String getTransactionId() {
@@ -153,14 +117,45 @@ public final class TransactionStore {
             return challengeToken;
         }
 
-        public long getServerTimestampMicros() {
-            return serverTimestampMicros;
-        }
-
         public String getSaltSequence() {
             return saltSequence;
         }
 
-        
+        public long getServerTimestampMicros() {
+            return serverTimestampMicros;
+        }
+
+        public synchronized String getCurrentChainHash() {
+            return currentChainHash;
+        }
+
+        public boolean isConsumed() {
+            return consumed.get();
+        }
+
+        public boolean consumeOnly() {
+            return consumed.compareAndSet(false, true);
+        }
+
+        public synchronized boolean consumeAndAdvance(
+                String previousChainHash,
+                String nextChainHash) {
+
+            if (previousChainHash == null || nextChainHash == null) {
+                return false;
+            }
+
+            if (!HmacSecurity.constantTimeEquals(
+                    currentChainHash, previousChainHash)) {
+                return false;
+            }
+
+            if (!consumed.compareAndSet(false, true)) {
+                return false;
+            }
+
+            currentChainHash = nextChainHash;
+            return true;
+        }
     }
 }

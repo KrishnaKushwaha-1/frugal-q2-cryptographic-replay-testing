@@ -149,4 +149,149 @@ class TransactionStoreTest {
             executor.shutdownNow();
         }
     }
+    
+    @Test
+    void shouldGenerateValidInitialChainHash() {
+
+        var transaction = store.createTransaction();
+
+        String initialHash = transaction.getCurrentChainHash();
+
+        assertNotNull(initialHash);
+        assertEquals(128, initialHash.length());
+        assertTrue(initialHash.matches("[0-9a-f]{128}"));
+
+        System.out.println(
+                "[PASS] Initial chain hash generated successfully"
+        );
+    }
+
+    @Test
+    void shouldAdvanceChainAndRejectStaleHash() {
+
+        var transaction = store.createTransaction();
+
+        String id = transaction.getTransactionId();
+        String initialHash = transaction.getCurrentChainHash();
+
+        String nextHash =
+                HmacSecurity.sha512Hex("next-chain-state");
+
+        // A stale hash must not advance the chain.
+        assertFalse(
+                store.consumeChallengeAndAdvanceChain(
+                        id,
+                        "incorrect-previous-hash",
+                        nextHash
+                )
+        );
+
+        assertEquals(
+                initialHash,
+                transaction.getCurrentChainHash()
+        );
+
+        // The correct previous hash should advance the chain.
+        assertTrue(
+                store.consumeChallengeAndAdvanceChain(
+                        id,
+                        initialHash,
+                        nextHash
+                )
+        );
+
+        assertEquals(
+                nextHash,
+                transaction.getCurrentChainHash()
+        );
+
+        // The same challenge cannot be consumed again.
+        assertFalse(
+                store.consumeChallengeAndAdvanceChain(
+                        id,
+                        initialHash,
+                        HmacSecurity.sha512Hex("another-state")
+                )
+        );
+
+        System.out.println(
+                "[PASS] Chain advanced and stale hash rejected"
+        );
+    }
+
+    @Test
+    void shouldPreventConcurrentChainAdvancement()
+            throws InterruptedException {
+
+        var transaction = store.createTransaction();
+
+        String id = transaction.getTransactionId();
+        String initialHash = transaction.getCurrentChainHash();
+
+        int threadCount = 20;
+
+        ExecutorService executor =
+                Executors.newFixedThreadPool(threadCount);
+
+        CountDownLatch ready = new CountDownLatch(threadCount);
+        CountDownLatch start = new CountDownLatch(1);
+
+        AtomicInteger successfulRequests = new AtomicInteger(0);
+
+        String nextHash =
+                HmacSecurity.sha512Hex("concurrent-next-state");
+
+        try {
+            for (int i = 0; i < threadCount; i++) {
+
+                executor.submit(() -> {
+
+                    ready.countDown();
+
+                    try {
+                        start.await();
+
+                        boolean success =
+                                store.consumeChallengeAndAdvanceChain(
+                                        id,
+                                        initialHash,
+                                        nextHash
+                                );
+
+                        if (success) {
+                            successfulRequests.incrementAndGet();
+                        }
+
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+            }
+
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+
+            start.countDown();
+
+            executor.shutdown();
+
+            assertTrue(
+                    executor.awaitTermination(5, TimeUnit.SECONDS)
+            );
+
+            assertEquals(1, successfulRequests.get());
+
+            assertEquals(
+                    nextHash,
+                    transaction.getCurrentChainHash()
+            );
+
+            System.out.println(
+                    "[PASS] Concurrent chain advancement: only one succeeded"
+            );
+
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
 }

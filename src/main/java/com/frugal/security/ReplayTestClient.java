@@ -48,14 +48,15 @@ public class ReplayTestClient {
             );
         }
 
+        // 2. Extract transaction ID directly from Location.
         String location = createResponse.headers()
                 .firstValue("Location")
                 .orElseThrow(() ->
                         new IllegalStateException("Location header missing"));
 
-        String transactionId = extract(
-                createResponse.body(), "transactionId");
+        String transactionId = extractTransactionId(location);
 
+        // 3. Extract server-issued security values.
         String challenge = extract(
                 createResponse.body(), "challengeToken");
 
@@ -65,31 +66,36 @@ public class ReplayTestClient {
         String salt = extract(
                 createResponse.body(), "saltSequence");
 
+        String initialChainHash = extract(
+                createResponse.body(), "initialChainHash");
+
         add(report, "========== FRUGAL Q2 REPLAY TEST ==========");
         add(report, "Execution time: " + LocalDateTime.now());
         add(report, "Transaction ID: " + transactionId);
         add(report, "Location: " + location);
         add(report, "POST status: " + createResponse.statusCode());
         add(report, "Server timestamp (microseconds): " + timestamp);
+        add(report, "Initial chain hash: " + initialChainHash);
 
-        // 2. Prepare exact raw request body.
+        // 4. Prepare exact raw request body.
         String rawBody = """
                 {"status":"APPROVED","amount":500}
                 """.strip();
 
-        // 3. Generate HMAC-SHA512.
-        String saltWithChallenge = salt + "." + challenge;
-
+        // 5. Generate HMAC-SHA512 using the previous chain hash.
         String mac = HmacSecurity.generateMac(
                 rawBody,
                 Long.parseLong(timestamp),
-                saltWithChallenge,
+                salt,
+                challenge,
+                initialChainHash,
                 SECRET
         );
 
         URI updateUri = URI.create(BASE_URL + location);
 
-        // Build once and reuse the exact same request.
+        // Build the PUT request once.
+        // The exact same immutable request is reused for replay.
         HttpRequest updateRequest = HttpRequest.newBuilder()
                 .uri(updateUri)
                 .timeout(Duration.ofSeconds(5))
@@ -97,10 +103,11 @@ public class ReplayTestClient {
                 .header("X-Challenge-Token", challenge)
                 .header("X-Timestamp-Micros", timestamp)
                 .header("X-Frugal-Mac", mac)
+                .header("X-Frugal-Chain-Hash", initialChainHash)
                 .PUT(HttpRequest.BodyPublishers.ofString(rawBody))
                 .build();
 
-        // 4. Send original PUT.
+        // 6. Send original PUT.
         HttpResponse<String> firstResponse = client.send(
                 updateRequest,
                 HttpResponse.BodyHandlers.ofString()
@@ -109,11 +116,11 @@ public class ReplayTestClient {
         long firstCompletedAt = System.nanoTime();
 
         add(report, "");
-        add(report, "FIRST PUT");
+        add(report, "========== FIRST PUT ==========");
         add(report, "HTTP status: " + firstResponse.statusCode());
         add(report, "Response: " + firstResponse.body());
 
-        // 5. Immediately replay the exact same request.
+        // 7. Immediately replay the exact same request.
         long replayStartedAt = System.nanoTime();
 
         HttpResponse<String> replayResponse = client.send(
@@ -121,27 +128,41 @@ public class ReplayTestClient {
                 HttpResponse.BodyHandlers.ofString()
         );
 
-        long replayElapsedNanos = replayStartedAt - firstCompletedAt;
-        double replayElapsedMillis = replayElapsedNanos / 1_000_000.0;
+        long replayElapsedNanos =
+                replayStartedAt - firstCompletedAt;
+
+        double replayElapsedMillis =
+                replayElapsedNanos / 1_000_000.0;
 
         add(report, "");
-        add(report, "REPLAY PUT");
+        add(report, "========== REPLAY PUT ==========");
         add(report, "HTTP status: " + replayResponse.statusCode());
         add(report, "Response: " + replayResponse.body());
+
         add(report, String.format(
                 "Replay sent %.3f ms after first PUT completion",
                 replayElapsedMillis
         ));
 
-        // 6. Evaluate the assignment requirements.
-        boolean firstAccepted = firstResponse.statusCode() == 200;
-        boolean replayRejected = replayResponse.statusCode() == 409;
-        boolean withinWindow = replayElapsedNanos >= 0
-                && replayElapsedNanos <= 150_000_000L;
+        // 8. Evaluate assignment requirements.
+        boolean firstAccepted =
+                firstResponse.statusCode() == 200;
+
+        boolean chainAdvanced =
+                firstResponse.body().contains("\"chainAdvanced\": true")
+                        || firstResponse.body().contains("\"chainAdvanced\":true");
+
+        boolean replayRejected =
+                replayResponse.statusCode() == 409;
+
+        boolean withinWindow =
+                replayElapsedNanos >= 0
+                        && replayElapsedNanos <= 150_000_000L;
 
         add(report, "");
         add(report, "========== TEST RESULT ==========");
         add(report, "First PUT accepted: " + firstAccepted);
+        add(report, "Hash-chain advanced: " + chainAdvanced);
         add(report, "Replay rejected: " + replayRejected);
         add(report, "Replay within 150 ms: " + withinWindow);
 
@@ -150,16 +171,20 @@ public class ReplayTestClient {
 
             add(report,
                     "HIGH-RISK ALERT: REPLAY ACCEPTED. "
-                    + "POTENTIAL DATA-MUTATION VULNERABILITY.");
+                            + "POTENTIAL DATA-MUTATION VULNERABILITY.");
         }
 
-        boolean passed = firstAccepted && replayRejected && withinWindow;
+        boolean passed =
+                firstAccepted
+                        && chainAdvanced
+                        && replayRejected
+                        && withinWindow;
 
         add(report, passed
                 ? "RESULT: PASS - Replay attack prevented."
                 : "RESULT: FAIL - Replay security requirements not satisfied.");
 
-        // 7. Print and persist evidence.
+        // 9. Print and persist evidence.
         System.out.println(report);
 
         Path logDirectory = Path.of("artifacts", "logs");
@@ -180,13 +205,30 @@ public class ReplayTestClient {
                 StandardOpenOption.WRITE
         );
 
-        System.out.println("\nEvidence saved to: " + logFile.toAbsolutePath());
+        System.out.println(
+                "\nEvidence saved to: " + logFile.toAbsolutePath()
+        );
 
         if (!passed) {
             throw new IllegalStateException(
                     "Replay security test failed. Check the evidence log."
             );
         }
+    }
+
+    private static String extractTransactionId(String location) {
+
+        String normalized = location.replaceAll("/+$", "");
+
+        int lastSlash = normalized.lastIndexOf('/');
+
+        if (lastSlash < 0 || lastSlash == normalized.length() - 1) {
+            throw new IllegalStateException(
+                    "Invalid transaction Location header: " + location
+            );
+        }
+
+        return normalized.substring(lastSlash + 1);
     }
 
     private static void add(StringBuilder report, String line) {
@@ -204,7 +246,8 @@ public class ReplayTestClient {
 
         if (!matcher.find()) {
             throw new IllegalStateException(
-                    "Could not extract JSON field: " + key);
+                    "Could not extract JSON field: " + key
+            );
         }
 
         return matcher.group(1).trim();

@@ -7,7 +7,6 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -96,7 +95,6 @@ public final class MockApiServer {
 
         String transactionId = transaction.getTransactionId();
 
-        // Transaction ID is deliberately returned in the header.
         exchange.getResponseHeaders().set(
                 "Location",
                 "/transactions/" + transactionId
@@ -108,19 +106,25 @@ public final class MockApiServer {
                     "transactionId": "%s",
                     "challengeToken": "%s",
                     "serverTimestampMicros": %d,
-                    "saltSequence": "%s"
+                    "saltSequence": "%s",
+                    "initialChainHash": "%s"
                 }
                 """.formatted(
                 transactionId,
                 transaction.getChallengeToken(),
                 transaction.getServerTimestampMicros(),
-                transaction.getSaltSequence()
+                transaction.getSaltSequence(),
+                transaction.getCurrentChainHash()
         );
 
         sendJson(exchange, 201, response);
 
         System.out.println(
                 "[TRANSACTION CREATED] " + transactionId
+        );
+        System.out.println(
+                "[INITIAL CHAIN HASH] "
+                        + transaction.getCurrentChainHash()
         );
     }
 
@@ -159,9 +163,13 @@ public final class MockApiServer {
         String timestampHeader = exchange.getRequestHeaders()
                 .getFirst("X-Timestamp-Micros");
 
+        String previousChainHash = exchange.getRequestHeaders()
+                .getFirst("X-Frugal-Chain-Hash");
+
         if (challenge == null
                 || receivedMac == null
-                || timestampHeader == null) {
+                || timestampHeader == null
+                || previousChainHash == null) {
 
             sendJson(exchange, 400,
                     "{\"error\":\"Missing security headers\"}");
@@ -216,7 +224,6 @@ public final class MockApiServer {
             return;
         }
 
-        // Preserve the exact request body bytes as UTF-8 text.
         String rawBody = new String(
                 exchange.getRequestBody().readAllBytes(),
                 StandardCharsets.UTF_8
@@ -228,13 +235,24 @@ public final class MockApiServer {
             return;
         }
 
-        String saltWithChallenge =
-                transaction.getSaltSequence() + "." + challenge;
+        // Verify that the supplied hash is the current chain state.
+        if (!HmacSecurity.constantTimeEquals(
+                transaction.getCurrentChainHash(),
+                previousChainHash)) {
 
+            sendJson(exchange, 409,
+                    "{\"error\":\"Invalid or stale chain hash\"}");
+            return;
+        }
+
+        // HMAC covers the body, timestamp, salt, challenge,
+        // and previous hash-chain state.
         String expectedMac = HmacSecurity.generateMac(
                 rawBody,
                 clientTimestamp,
-                saltWithChallenge,
+                transaction.getSaltSequence(),
+                challenge,
+                previousChainHash,
                 SECRET
         );
 
@@ -245,9 +263,16 @@ public final class MockApiServer {
             return;
         }
 
-        // Atomic replay protection.
-        // Only one request can consume this challenge.
-        if (!transactionStore.consumeChallenge(transactionId)) {
+        // Advance the chain only after every security check passes.
+        String nextChainHash = HmacSecurity.sha512Hex(
+                previousChainHash + "." + receivedMac + "." + rawBody
+        );
+
+        // Atomic one-time challenge consumption and chain advancement.
+        if (!transactionStore.consumeChallengeAndAdvanceChain(
+                transactionId,
+                previousChainHash,
+                nextChainHash)) {
 
             System.err.println(
                     "[REPLAY DETECTED] " + transactionId
@@ -262,8 +287,19 @@ public final class MockApiServer {
                 "[TRANSACTION UPDATED] " + transactionId
         );
 
-        sendJson(exchange, 200,
-                "{\"message\":\"Transaction updated successfully\"}");
+        System.out.println(
+                "[HASH-CHAIN ADVANCED] " + nextChainHash
+        );
+
+        String response = """
+                {
+                    "message": "Transaction updated successfully",
+                    "chainAdvanced": true,
+                    "nextChainHash": "%s"
+                }
+                """.formatted(nextChainHash);
+
+        sendJson(exchange, 200, response);
     }
 
     private void sendJson(

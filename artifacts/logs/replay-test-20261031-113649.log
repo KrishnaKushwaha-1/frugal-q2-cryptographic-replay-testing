@@ -1,0 +1,28 @@
+========== FRUGAL Q2 REPLAY TEST ==========
+Execution time: 2026-10-31T11:36:49.476720800
+Transaction ID: 41f54d78910b48d2b4ef5dbd4869b769
+Location: /transactions/41f54d78910b48d2b4ef5dbd4869b769
+POST status: 201
+Server timestamp (microseconds): 1793426809437000
+Initial chain hash: 38c3b8dce831ec88e81998ca5d6dc7a4a7e837531b9934b01bea7880d20ad5c9c792721d9aedc6275e82631265fd3faf77f586da1f3efdcce6e09516a11eb156
+
+========== FIRST PUT ==========
+HTTP status: 200
+Response: {
+    "message": "Transaction updated successfully",
+    "chainAdvanced": true,
+    "nextChainHash": "95854648e47617fcd726c46d60d022929585d924de141d1a7e183a463035fb696d3864074e64d54198564faf22be71f20f433fc5ad42fae411429b653ffec22d"
+}
+
+
+========== REPLAY PUT ==========
+HTTP status: 409
+Response: {"error":"Invalid or stale chain hash"}
+Replay sent 0.151 ms after first PUT completion
+
+========== TEST RESULT ==========
+First PUT accepted: true
+Hash-chain advanced: true
+Replay rejected: true
+Replay within 150 ms: true
+RESULT: PASS - Replay attack prevented.

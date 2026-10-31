@@ -90,4 +90,56 @@ class HmacValidationTest {
 
         System.out.println("[PASS] Different payload detected");
     }
+
+    @Test
+    void shouldGenerateDeterministicSha512Hash() {
+
+        String firstHash =
+                HmacSecurity.sha512Hex("frugal-hash-chain");
+
+        String secondHash =
+                HmacSecurity.sha512Hex("frugal-hash-chain");
+
+        assertEquals(firstHash, secondHash);
+        assertEquals(128, firstHash.length());
+        assertTrue(firstHash.matches("[0-9a-f]{128}"));
+
+        System.out.println(
+                "[PASS] SHA-512 hash is deterministic and valid"
+        );
+    }
+
+    @Test
+    void shouldBindPreviousChainHashToHmac() {
+
+        String firstMac = HmacSecurity.generateMac(
+                BODY,
+                1793430000123456L,
+                "salt-sequence-001",
+                "challenge-token-001",
+                "previous-chain-hash-001",
+                SECRET
+        );
+
+        String changedChainMac = HmacSecurity.generateMac(
+                BODY,
+                1793430000123456L,
+                "salt-sequence-001",
+                "challenge-token-001",
+                "previous-chain-hash-002",
+                SECRET
+        );
+
+        assertNotEquals(firstMac, changedChainMac);
+
+        assertFalse(
+                HmacSecurity.verifyMac(changedChainMac, firstMac)
+        );
+
+        System.out.println(
+                "[PASS] HMAC detects modified previous chain hash"
+        );
+    }
+
+
 }
